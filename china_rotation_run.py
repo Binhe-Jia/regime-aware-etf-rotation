@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,24 @@ DEFAULT_UNIVERSE = [
     "601012.SS",  # LONGi
 ]
 
+CHINA_ETF_PRESETS = {
+    "china_broad_etfs": [
+        "510300.SS",  # CSI 300 ETF
+        "510500.SS",  # CSI 500 ETF
+        "512100.SS",  # CSI 1000 ETF
+        "159915.SZ",  # ChiNext ETF
+        "588000.SS",  # STAR 50 ETF
+    ],
+    "china_style_etfs": [
+        "510300.SS",  # CSI 300 ETF
+        "510050.SS",  # SSE 50 ETF
+        "510500.SS",  # CSI 500 ETF
+        "512100.SS",  # CSI 1000 ETF
+        "159915.SZ",  # ChiNext ETF
+        "515000.SS",  # technology ETF
+    ],
+}
+
 
 @dataclass(frozen=True)
 class RotationConfig:
@@ -40,6 +59,22 @@ class RotationConfig:
     momentum_slow: int = 252
     skip_recent_days: int = 20
     volatility_window: int = 63
+    momentum_top_n: int = 1
+    momentum_score_mode: str = "raw"
+    momentum_confirmation: str = "none"
+    defensive_asset: str | None = None
+    breadth_adjusted: bool = False
+    breadth_full_threshold: float = 0.60
+    breadth_partial_threshold: float = 0.40
+    breadth_partial_exposure: float = 0.50
+    regime_filter: bool = False
+    regime_stress_exposure: float = 0.50
+    regime_defensive_asset: str | None = None
+    regime_train_years: int = 3
+    regime_n_components: int = 3
+    regime_n_regimes: int = 2
+    regime_retrain_frequency: str = "M"
+    regime_signal_lag: int = 1
     max_annual_volatility: float = 0.80
     max_gross_exposure: float = 1.0
     risk_mode: str = "none"
@@ -49,6 +84,8 @@ class RotationConfig:
     quality_require_positive_fcf: bool = False
     transaction_cost_bps: float = 6.0
     slippage_bps: float = 8.0
+    rebalance_tolerance_by_asset: dict[str, float] | None = None
+    rebalance_to: str = "target"
 
 
 def parse_universe(text: str | None) -> list[str]:
@@ -58,6 +95,64 @@ def parse_universe(text: str | None) -> list[str]:
     if not raw:
         return DEFAULT_UNIVERSE
     return [normalize_china_symbol(item) for item in raw]
+
+
+def load_point_in_time_universe(path: Path, snapshot_date: str) -> tuple[list[str], pd.Timestamp]:
+    data = pd.read_csv(path)
+    lower_columns = {column.lower().strip(): column for column in data.columns}
+    date_col = lower_columns.get("date") or lower_columns.get("snapshot_date")
+    ticker_col = lower_columns.get("ticker") or lower_columns.get("symbol")
+    if date_col is None or ticker_col is None:
+        raise SystemExit("Universe file must include date and ticker columns.")
+
+    data = data.rename(columns={date_col: "date", ticker_col: "ticker"}).copy()
+    data["date"] = pd.to_datetime(data["date"])
+    requested = pd.to_datetime(snapshot_date)
+    available_dates = data.loc[data["date"] <= requested, "date"]
+    if available_dates.empty:
+        raise SystemExit(f"No universe snapshot on or before {snapshot_date}.")
+
+    chosen_date = available_dates.max()
+    tickers = (
+        data.loc[data["date"] == chosen_date, "ticker"]
+        .dropna()
+        .astype(str)
+        .map(normalize_china_symbol)
+        .drop_duplicates()
+        .tolist()
+    )
+    if not tickers:
+        raise SystemExit(f"Universe snapshot {chosen_date.date()} has no tickers.")
+    return tickers, chosen_date
+
+
+def parse_tolerance_values(text: str) -> list[float]:
+    values = []
+    for item in text.split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    return values or [0.0, 0.05, 0.10, 0.15, 0.20]
+
+
+def parse_tolerance_band_map(
+    text: str | None,
+    normalizer=normalize_china_symbol,
+) -> dict[str, float]:
+    if not text:
+        return {}
+    bands = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(
+                "Tolerance bands must use ticker=value pairs, for example 510300.SS=0.025,SPY=0.075."
+            )
+        ticker, value = item.split("=", 1)
+        bands[normalizer(ticker.strip())] = float(value)
+    return bands
 
 
 def load_quality_csv(path: Path | None) -> pd.DataFrame | None:
@@ -227,10 +322,22 @@ def generate_rotation_weights(
     quality_data: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     stock_cols = [column for column in closes.columns if column != market_col]
-    stock_closes = closes.loc[:, stock_cols]
+    defensive_assets = {
+        asset
+        for asset in [config.defensive_asset, config.regime_defensive_asset]
+        if asset is not None
+    }
+    allocation_cols = [column for column in stock_cols if column not in defensive_assets] or stock_cols
+    stock_closes = closes.loc[:, allocation_cols]
     stock_ma = stock_closes.rolling(config.stock_ma_window).mean()
-    scores = build_scores(closes, market_col, config)
+    scores = build_scores(closes, market_col, config).reindex(columns=allocation_cols)
     volatility = stock_closes.pct_change().rolling(config.volatility_window).std() * np.sqrt(252)
+    returns_3m = stock_closes / stock_closes.shift(63) - 1.0
+    returns_6m = stock_closes / stock_closes.shift(126) - 1.0
+    returns_12m = stock_closes / stock_closes.shift(config.momentum_slow) - 1.0
+    vol_6m = stock_closes.pct_change().rolling(126).std() * np.sqrt(252)
+    vol_12m = stock_closes.pct_change().rolling(config.momentum_slow).std() * np.sqrt(252)
+    ma_100 = stock_closes.rolling(100).mean()
     weights = pd.DataFrame(0.0, index=closes.index, columns=stock_cols)
 
     market_ma = closes[market_col].rolling(config.market_ma_window).mean()
@@ -246,6 +353,9 @@ def generate_rotation_weights(
     valid_allocations = {
         "top_n",
         "equal_weight",
+        "ivy_trend_filter",
+        "dual_momentum",
+        "protective_dual_momentum",
         "core_satellite",
         "inverse_vol",
         "trend_equal_weight",
@@ -262,9 +372,84 @@ def generate_rotation_weights(
             current[:] = 0.0
             if bool(risk_on.loc[date]):
                 if allocation_mode == "equal_weight":
-                    current[:] = config.max_gross_exposure / len(stock_cols)
+                    current.loc[allocation_cols] = config.max_gross_exposure / len(allocation_cols)
+                elif allocation_mode == "ivy_trend_filter":
+                    trend = stock_closes.loc[date] > stock_ma.loc[date]
+                    current.loc[trend[trend].index] = config.max_gross_exposure / len(allocation_cols)
+                elif allocation_mode in {"dual_momentum", "protective_dual_momentum"}:
+                    momentum_cols = [
+                        column for column in allocation_cols if column != config.defensive_asset
+                    ]
+                    trailing_return = returns_12m.loc[date].reindex(momentum_cols)
+                    eligible = trailing_return > 0.0
+                    if config.momentum_confirmation == "ma200":
+                        eligible &= stock_closes.loc[date].reindex(momentum_cols) > stock_ma.loc[
+                            date
+                        ].reindex(momentum_cols)
+                    elif config.momentum_confirmation == "fast":
+                        eligible &= returns_3m.loc[date].reindex(momentum_cols) > 0.0
+                        eligible &= stock_closes.loc[date].reindex(momentum_cols) > stock_ma.loc[
+                            date
+                        ].reindex(momentum_cols)
+                    elif config.momentum_confirmation == "aggressive":
+                        eligible &= returns_6m.loc[date].reindex(momentum_cols) > 0.0
+                        eligible &= stock_closes.loc[date].reindex(momentum_cols) > ma_100.loc[
+                            date
+                        ].reindex(momentum_cols)
+                        eligible &= stock_closes.loc[date].reindex(momentum_cols) > stock_ma.loc[
+                            date
+                        ].reindex(momentum_cols)
+                    elif config.momentum_confirmation != "none":
+                        raise ValueError(
+                            "momentum_confirmation must be one of: none, ma200, fast, aggressive"
+                        )
+
+                    if config.momentum_score_mode == "raw":
+                        momentum_score = trailing_return
+                    elif config.momentum_score_mode == "risk_adjusted":
+                        momentum_score = trailing_return / vol_12m.loc[date].reindex(
+                            momentum_cols
+                        ).replace(0.0, np.nan)
+                    elif config.momentum_score_mode == "blended_risk_adjusted":
+                        score_6m = returns_6m.loc[date].reindex(momentum_cols) / vol_6m.loc[
+                            date
+                        ].reindex(momentum_cols).replace(0.0, np.nan)
+                        score_12m = trailing_return / vol_12m.loc[date].reindex(
+                            momentum_cols
+                        ).replace(0.0, np.nan)
+                        momentum_score = 0.5 * score_6m + 0.5 * score_12m
+                    else:
+                        raise ValueError(
+                            "momentum_score_mode must be one of: raw, risk_adjusted, blended_risk_adjusted"
+                        )
+
+                    ranked = momentum_score.where(eligible).dropna().sort_values(ascending=False)
+                    selected = ranked.head(max(1, config.momentum_top_n)).index
+                    risk_exposure = config.max_gross_exposure
+                    use_breadth = config.breadth_adjusted or allocation_mode == "protective_dual_momentum"
+                    if use_breadth:
+                        breadth = float((trailing_return > 0.0).mean()) if len(trailing_return) else 0.0
+                        if len(selected) == 0:
+                            risk_exposure = 0.0
+                        elif breadth >= config.breadth_full_threshold:
+                            risk_exposure = config.max_gross_exposure
+                        elif breadth >= config.breadth_partial_threshold:
+                            risk_exposure = (
+                                config.max_gross_exposure * config.breadth_partial_exposure
+                            )
+                        else:
+                            risk_exposure = 0.0
+                    if len(selected) > 0:
+                        current.loc[selected] = risk_exposure / len(selected)
+                    defensive_exposure = config.max_gross_exposure - float(current.sum())
+                    if (
+                        defensive_exposure > 0.0
+                        and config.defensive_asset
+                        and config.defensive_asset in current.index
+                    ):
+                        current.loc[config.defensive_asset] = defensive_exposure
                 elif allocation_mode == "quality_equal_weight":
-                    selected = quality_candidates(stock_cols, quality_data, config)
+                    selected = quality_candidates(allocation_cols, quality_data, config)
                     current.loc[selected] = config.max_gross_exposure / len(selected)
                 elif allocation_mode == "inverse_vol":
                     inv_vol = 1.0 / volatility.loc[date].replace(0.0, np.nan)
@@ -297,8 +482,8 @@ def generate_rotation_weights(
                     else:
                         core_weight = float(np.clip(config.core_weight, 0.0, 1.0))
                         satellite_weight = 1.0 - core_weight
-                        current[:] = (
-                            config.max_gross_exposure * core_weight / len(stock_cols)
+                        current.loc[allocation_cols] = (
+                            config.max_gross_exposure * core_weight / len(allocation_cols)
                         )
                         if len(selected) > 0 and satellite_weight > 0:
                             current.loc[selected] += (
@@ -320,9 +505,63 @@ def backtest_rotation(
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     targets = generate_rotation_weights(closes, market_col, config, quality_data)
     stock_returns = closes.drop(columns=[market_col]).pct_change().fillna(0.0)
+    regime_stress = pd.Series(False, index=closes.index)
+    if config.regime_filter:
+        from regime_filter import RegimeConfig, generate_regime_signals
+
+        regime_defensive_assets = {
+            asset
+            for asset in [config.defensive_asset, config.regime_defensive_asset]
+            if asset is not None
+        }
+        regime_asset_cols = [
+            column
+            for column in stock_returns.columns
+            if column not in regime_defensive_assets
+        ]
+        regime_signals = generate_regime_signals(
+            closes,
+            market_col,
+            asset_cols=regime_asset_cols,
+            config=RegimeConfig(
+                n_components=config.regime_n_components,
+                n_regimes=config.regime_n_regimes,
+                train_years=config.regime_train_years,
+                retrain_frequency=config.regime_retrain_frequency,
+            ),
+        )
+        regime_stress = (
+            regime_signals["regime_stress"]
+            .shift(config.regime_signal_lag)
+            .reindex(closes.index)
+            .ffill()
+            .infer_objects(copy=False)
+            .fillna(False)
+            .astype(bool)
+        )
+        stress_exposure = float(np.clip(config.regime_stress_exposure, 0.0, 1.0))
+        risky_cols = [
+            column
+            for column in targets.columns
+            if column not in regime_defensive_assets
+        ]
+        stress_rows = regime_stress[regime_stress].index
+        if len(stress_rows) > 0 and risky_cols:
+            targets.loc[stress_rows, risky_cols] *= stress_exposure
+            defensive_asset = config.regime_defensive_asset or config.defensive_asset
+            if defensive_asset and defensive_asset in targets.columns:
+                defensive_weight = (
+                    config.max_gross_exposure - targets.loc[stress_rows].sum(axis=1)
+                ).clip(lower=0.0)
+                targets.loc[stress_rows, defensive_asset] += defensive_weight
     cost_rate = (config.transaction_cost_bps + config.slippage_bps) / 10_000.0
 
-    equal_weight = stock_returns.mean(axis=1)
+    benchmark_cols = [
+        column
+        for column in stock_returns.columns
+        if column not in {config.defensive_asset, config.regime_defensive_asset}
+    ] or stock_returns.columns.tolist()
+    equal_weight = stock_returns.loc[:, benchmark_cols].mean(axis=1)
     market_return = closes[market_col].pct_change().fillna(0.0)
     rebalance_dates = set(month_or_week_rebalance_dates(closes.index, config.rebalance))
     if len(closes.index) > 0:
@@ -352,11 +591,39 @@ def backtest_rotation(
         if date in rebalance_dates:
             target = targets.loc[date].fillna(0.0)
             drift = (target - drifted_weights).abs()
-            should_trade = i == 0 or bool((drift > config.rebalance_tolerance).any())
+            if config.rebalance_tolerance_by_asset:
+                tolerance = pd.Series(
+                    {
+                        asset: config.rebalance_tolerance_by_asset.get(
+                            asset,
+                            config.rebalance_tolerance,
+                        )
+                        for asset in drift.index
+                    }
+                )
+            else:
+                tolerance = pd.Series(config.rebalance_tolerance, index=drift.index)
+            should_trade = i == 0 or bool((drift > tolerance).any())
             if should_trade:
-                daily_turnover = float(drift.sum())
+                if i == 0 or config.rebalance_to == "target":
+                    desired_weights = target.copy()
+                elif config.rebalance_to == "corridor":
+                    desired_weights = drifted_weights.copy()
+                    upper = target + tolerance
+                    lower = (target - tolerance).clip(lower=0.0)
+                    over_upper = drifted_weights > upper
+                    under_lower = drifted_weights < lower
+                    desired_weights.loc[over_upper] = upper.loc[over_upper]
+                    desired_weights.loc[under_lower] = lower.loc[under_lower]
+                    desired_weights.loc[target <= 0.0] = 0.0
+                    if desired_weights.sum() > config.max_gross_exposure:
+                        desired_weights *= config.max_gross_exposure / desired_weights.sum()
+                else:
+                    raise ValueError("rebalance_to must be one of: target, corridor")
+
+                daily_turnover = float((desired_weights - drifted_weights).abs().sum())
                 equity *= 1.0 - daily_turnover * cost_rate
-                current_weights = target.copy()
+                current_weights = desired_weights.copy()
             else:
                 current_weights = drifted_weights
         else:
@@ -374,6 +641,7 @@ def backtest_rotation(
             "equal_weight_return": equal_weight,
             "turnover": turnover,
             "exposure": weights.sum(axis=1),
+            "regime_stress": regime_stress.astype(float),
         },
         index=closes.index,
     )
@@ -407,9 +675,11 @@ def summarize(curve: pd.DataFrame) -> dict[str, float]:
         "sharpe": float(sharpe),
         "max_drawdown": float(drawdown.min()),
         "average_exposure": float(curve["exposure"].mean()),
+        "regime_stress_fraction": float(curve.get("regime_stress", pd.Series(0.0, index=curve.index)).mean()),
         "turnover": float(curve["turnover"].sum()),
         "market_return": float(market_return),
         "equal_weight_return": float(equal_weight_return),
+        "excess_vs_equal_weight": float(total_return - equal_weight_return),
     }
 
 
@@ -420,11 +690,14 @@ def run_grid_search(
     quality_data: pd.DataFrame | None = None,
     quality_options: dict[str, float | bool | None] | None = None,
     rebalance_tolerance: float = 0.0,
+    rebalance_tolerance_by_asset: dict[str, float] | None = None,
     sort_by: str = "total_return",
 ) -> pd.DataFrame:
     rows: list[dict[str, float | int | str]] = []
     allocations = [
         "equal_weight",
+        "ivy_trend_filter",
+        "dual_momentum",
         "inverse_vol",
         "trend_equal_weight",
         "score_weighted",
@@ -447,6 +720,11 @@ def run_grid_search(
                         core_weight=core_weight,
                         risk_mode=risk_mode,
                         rebalance_tolerance=rebalance_tolerance,
+                        rebalance_tolerance_by_asset=rebalance_tolerance_by_asset,
+                        rebalance_to="target",
+                        momentum_top_n=1,
+                        momentum_score_mode="raw",
+                        momentum_confirmation="none",
                         **(quality_options or {}),
                     )
                     curve, _, metrics = backtest_rotation(
@@ -475,6 +753,170 @@ def run_grid_search(
     return result.sort_values(sort_by, ascending=False).reset_index(drop=True)
 
 
+def run_tolerance_sweep(
+    closes: pd.DataFrame,
+    market_col: str,
+    args: argparse.Namespace,
+    values: list[float],
+    quality_data: pd.DataFrame | None = None,
+    quality_options: dict[str, float | bool | None] | None = None,
+) -> pd.DataFrame:
+    rows = []
+    baseline_equity = None
+    baseline_turnover = None
+    for tolerance in values:
+        config = RotationConfig(
+            allocation_mode=args.allocation,
+            top_n=args.top_n,
+            rebalance=args.rebalance,
+            rebalance_tolerance=tolerance,
+            rebalance_tolerance_by_asset=args.tolerance_band_map,
+            rebalance_to=args.rebalance_to,
+            core_weight=args.core_weight,
+            momentum_top_n=args.momentum_top_n,
+            momentum_score_mode=args.momentum_score_mode,
+            momentum_confirmation=args.momentum_confirmation,
+            defensive_asset=normalize_china_symbol(args.defensive_asset) if args.defensive_asset else None,
+            breadth_adjusted=args.breadth_adjusted,
+            breadth_full_threshold=args.breadth_full_threshold,
+            breadth_partial_threshold=args.breadth_partial_threshold,
+            breadth_partial_exposure=args.breadth_partial_exposure,
+            max_gross_exposure=args.max_exposure,
+            risk_mode=args.risk_mode,
+            **(quality_options or {}),
+        )
+        curve, _, metrics = backtest_rotation(
+            closes,
+            market_col,
+            config,
+            initial_equity=args.initial_capital,
+            quality_data=quality_data,
+        )
+        final_equity = float(curve["equity"].iloc[-1])
+        if tolerance == 0.0:
+            baseline_equity = final_equity
+            baseline_turnover = metrics["turnover"]
+        rows.append(
+            {
+                "rebalance_tolerance": tolerance,
+                "final_equity": final_equity,
+                "total_return": metrics["total_return"],
+                "excess_vs_equal_weight": metrics["excess_vs_equal_weight"],
+                "sharpe": metrics["sharpe"],
+                "max_drawdown": metrics["max_drawdown"],
+                "turnover": metrics["turnover"],
+                "turnover_saved_vs_0": np.nan,
+                "equity_added_vs_0": np.nan,
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    if baseline_equity is not None:
+        result["equity_added_vs_0"] = result["final_equity"] - baseline_equity
+    if baseline_turnover is not None:
+        result["turnover_saved_vs_0"] = baseline_turnover - result["turnover"]
+    return result.sort_values("final_equity", ascending=False).reset_index(drop=True)
+
+
+def _metric_value(metrics: dict[str, float], metric: str) -> float:
+    value = float(metrics.get(metric, np.nan))
+    if metric in {"max_drawdown"}:
+        return -abs(value)
+    return value
+
+
+def run_walk_forward_tolerance(
+    closes: pd.DataFrame,
+    market_col: str,
+    base_config: RotationConfig,
+    initial_equity: float,
+    values: list[float],
+    train_years: int = 3,
+    test_years: int = 1,
+    optimize_metric: str = "sharpe",
+    mode: str = "anchored",
+    quality_data: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if train_years < 1 or test_years < 1:
+        raise ValueError("train_years and test_years must both be at least 1.")
+    if mode not in {"anchored", "rolling"}:
+        raise ValueError("walk-forward mode must be one of: anchored, rolling")
+
+    start = closes.index.min()
+    final_date = closes.index.max()
+    first_test_start = start + pd.DateOffset(years=train_years)
+    test_start = first_test_start
+    equity = float(initial_equity)
+    rows = []
+
+    while test_start < final_date:
+        test_end = min(test_start + pd.DateOffset(years=test_years), final_date + pd.Timedelta(days=1))
+        train_start = start if mode == "anchored" else test_start - pd.DateOffset(years=train_years)
+        train = closes.loc[(closes.index >= train_start) & (closes.index < test_start)]
+        test = closes.loc[(closes.index >= test_start) & (closes.index < test_end)]
+        if len(train) < 252 or len(test) < 20:
+            test_start = test_end
+            continue
+
+        candidates = []
+        for tolerance in values:
+            config = dataclass_replace(base_config, rebalance_tolerance=tolerance)
+            train_curve, _, train_metrics = backtest_rotation(
+                train,
+                market_col,
+                config,
+                initial_equity=initial_equity,
+                quality_data=quality_data,
+            )
+            candidates.append(
+                {
+                    "tolerance": tolerance,
+                    "score": _metric_value(train_metrics, optimize_metric),
+                    "train_final_equity": float(train_curve["equity"].iloc[-1]),
+                    "train_total_return": train_metrics["total_return"],
+                    "train_sharpe": train_metrics["sharpe"],
+                    "train_max_drawdown": train_metrics["max_drawdown"],
+                }
+            )
+
+        candidates_df = pd.DataFrame(candidates).sort_values(
+            ["score", "train_final_equity"],
+            ascending=False,
+        )
+        best = candidates_df.iloc[0]
+        chosen_tolerance = float(best["tolerance"])
+        config = dataclass_replace(base_config, rebalance_tolerance=chosen_tolerance)
+        test_curve, _, test_metrics = backtest_rotation(
+            test,
+            market_col,
+            config,
+            initial_equity=equity,
+            quality_data=quality_data,
+        )
+        equity = float(test_curve["equity"].iloc[-1])
+        rows.append(
+            {
+                "train_start": train.index[0].date(),
+                "train_end": train.index[-1].date(),
+                "test_start": test.index[0].date(),
+                "test_end": test.index[-1].date(),
+                "chosen_tolerance": chosen_tolerance,
+                "train_score": float(best["score"]),
+                "train_total_return": float(best["train_total_return"]),
+                "train_sharpe": float(best["train_sharpe"]),
+                "train_max_drawdown": float(best["train_max_drawdown"]),
+                "oos_total_return": test_metrics["total_return"],
+                "oos_sharpe": test_metrics["sharpe"],
+                "oos_max_drawdown": test_metrics["max_drawdown"],
+                "oos_turnover": test_metrics["turnover"],
+                "oos_final_equity": equity,
+            }
+        )
+        test_start = test_end
+
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run a China A-share momentum and relative-strength rotation strategy."
@@ -483,6 +925,23 @@ def main() -> None:
         "--tickers",
         default=None,
         help="Comma-separated China tickers. Six-digit codes are auto-suffixed.",
+    )
+    parser.add_argument(
+        "--universe-file",
+        type=Path,
+        default=None,
+        help="CSV with date,ticker rows for point-in-time universe snapshots.",
+    )
+    parser.add_argument(
+        "--snapshot-date",
+        default=None,
+        help="Snapshot date to use with --universe-file. Defaults to --start if provided.",
+    )
+    parser.add_argument(
+        "--etf-preset",
+        choices=sorted(CHINA_ETF_PRESETS),
+        default=None,
+        help="Use a predefined China ETF universe instead of the default current stock leaders.",
     )
     parser.add_argument(
         "--market",
@@ -500,10 +959,59 @@ def main() -> None:
         help="Number of stocks to hold at each rebalance. Default: 4.",
     )
     parser.add_argument(
+        "--momentum-top-n",
+        type=int,
+        default=1,
+        help="For dual_momentum, hold this many positive-momentum winners. Default: 1.",
+    )
+    parser.add_argument(
+        "--momentum-score-mode",
+        choices=["raw", "risk_adjusted", "blended_risk_adjusted"],
+        default="raw",
+        help="For dual_momentum, rank by raw return or volatility-adjusted momentum. Default: raw.",
+    )
+    parser.add_argument(
+        "--momentum-confirmation",
+        choices=["none", "ma200", "fast", "aggressive"],
+        default="none",
+        help="For dual_momentum, require extra recent trend confirmation. Default: none.",
+    )
+    parser.add_argument(
+        "--defensive-asset",
+        default=None,
+        help="Optional ticker to hold when dual_momentum has no positive eligible asset.",
+    )
+    parser.add_argument(
+        "--breadth-adjusted",
+        action="store_true",
+        help="Scale dual-momentum exposure using the share of assets with positive 12-month momentum.",
+    )
+    parser.add_argument(
+        "--breadth-full-threshold",
+        type=float,
+        default=0.60,
+        help="Breadth needed for full risk exposure. Default: 0.60.",
+    )
+    parser.add_argument(
+        "--breadth-partial-threshold",
+        type=float,
+        default=0.40,
+        help="Breadth needed for partial risk exposure. Default: 0.40.",
+    )
+    parser.add_argument(
+        "--breadth-partial-exposure",
+        type=float,
+        default=0.50,
+        help="Risk exposure when breadth is between partial and full thresholds. Default: 0.50.",
+    )
+    parser.add_argument(
         "--allocation",
         choices=[
             "top_n",
             "equal_weight",
+            "ivy_trend_filter",
+            "dual_momentum",
+            "protective_dual_momentum",
             "core_satellite",
             "inverse_vol",
             "trend_equal_weight",
@@ -530,6 +1038,17 @@ def main() -> None:
         type=float,
         default=0.0,
         help="Only rebalance when a holding drifts this far from target weight. Default: 0.",
+    )
+    parser.add_argument(
+        "--rebalance-to",
+        choices=["target", "corridor"],
+        default="target",
+        help="Trade breached holdings back to target or only to the tolerance corridor edge. Default: target.",
+    )
+    parser.add_argument(
+        "--tolerance-bands",
+        default=None,
+        help="Optional asset-specific bands as ticker=value pairs, for example 510300.SS=0.025,159915.SZ=0.075.",
     )
     parser.add_argument(
         "--max-exposure",
@@ -595,20 +1114,86 @@ def main() -> None:
         help="Compare allocation modes and parameters, then rank them.",
     )
     parser.add_argument(
+        "--tolerance-sweep",
+        action="store_true",
+        help="Compare rebalance tolerance values net of transaction costs.",
+    )
+    parser.add_argument(
+        "--walk-forward-tolerance",
+        action="store_true",
+        help="Optimize tolerance on prior data and report next-period out-of-sample results.",
+    )
+    parser.add_argument(
+        "--walk-forward-mode",
+        choices=["anchored", "rolling"],
+        default="anchored",
+        help="Use expanding anchored training or rolling training. Default: anchored.",
+    )
+    parser.add_argument(
+        "--walk-forward-train-years",
+        type=int,
+        default=3,
+        help="Training years before each out-of-sample test. Default: 3.",
+    )
+    parser.add_argument(
+        "--walk-forward-test-years",
+        type=int,
+        default=1,
+        help="Out-of-sample test years per step. Default: 1.",
+    )
+    parser.add_argument(
+        "--walk-forward-metric",
+        default="sharpe",
+        help="Training metric used to choose tolerance, for example sharpe or total_return.",
+    )
+    parser.add_argument(
+        "--tolerance-values",
+        default="0,0.02,0.05,0.10,0.15,0.20,0.25",
+        help="Comma-separated tolerances for --tolerance-sweep.",
+    )
+    parser.add_argument(
+        "--point-in-time-universe",
+        action="store_true",
+        help="Confirm that --tickers is a point-in-time universe for the requested start date.",
+    )
+    parser.add_argument(
         "--sort-by",
         default="total_return",
         help="Metric for --grid-search ranking, for example total_return, sharpe, max_drawdown.",
     )
     args = parser.parse_args()
+    args.tolerance_band_map = parse_tolerance_band_map(args.tolerance_bands)
 
     market = normalize_china_symbol(args.market)
-    universe = parse_universe(args.tickers)
+    defensive_asset = normalize_china_symbol(args.defensive_asset) if args.defensive_asset else None
+    universe_source = "current China leader basket"
+    point_in_time_snapshot = None
+    if args.universe_file is not None:
+        snapshot_date = args.snapshot_date or args.start
+        if snapshot_date is None:
+            raise SystemExit("--universe-file requires --snapshot-date or --start.")
+        universe, point_in_time_snapshot = load_point_in_time_universe(
+            args.universe_file,
+            snapshot_date,
+        )
+        universe_source = f"point-in-time file snapshot {point_in_time_snapshot.date()}"
+        args.point_in_time_universe = True
+    elif args.etf_preset is not None:
+        universe = CHINA_ETF_PRESETS[args.etf_preset]
+        universe_source = f"ETF preset {args.etf_preset}"
+        args.point_in_time_universe = True
+    else:
+        universe = parse_universe(args.tickers)
+    if defensive_asset and defensive_asset != market and defensive_asset not in universe:
+        universe = [*universe, defensive_asset]
     tickers = [market, *[ticker for ticker in universe if ticker != market]]
+    survivor_universe = not args.synthetic and not args.point_in_time_universe
 
     if args.synthetic:
         closes = make_synthetic_rotation_data()
         market = "510300.SS"
         data_source = "synthetic China rotation data"
+        universe_source = "synthetic generated universe"
     else:
         closes = load_yfinance_closes(
             tickers=tickers,
@@ -630,14 +1215,114 @@ def main() -> None:
         "quality_require_positive_fcf": args.quality_require_positive_fcf,
     }
 
+    if args.tolerance_sweep:
+        result = run_tolerance_sweep(
+            closes,
+            market,
+            args,
+            parse_tolerance_values(args.tolerance_values),
+            quality_data=quality_data,
+            quality_options=quality_options,
+        )
+        display_cols = [
+            "rebalance_tolerance",
+            "final_equity",
+            "total_return",
+            "excess_vs_equal_weight",
+            "sharpe",
+            "max_drawdown",
+            "turnover",
+            "turnover_saved_vs_0",
+            "equity_added_vs_0",
+        ]
+        print(f"Data source: {data_source}")
+        print(f"Rows: {len(closes)} | Start: {closes.index[0].date()} | End: {closes.index[-1].date()}")
+        print(f"Universe source: {universe_source}")
+        print(f"Initial capital: {args.initial_capital:,.2f}")
+        if survivor_universe:
+            print("Bias warning: current-survivor universe, not point-in-time constituents.")
+        print("Ranked by: final_equity")
+        print()
+        print(result.loc[:, display_cols].round(4).to_string(index=False))
+        return
+
+    if args.walk_forward_tolerance:
+        base_config = RotationConfig(
+            allocation_mode=args.allocation,
+            top_n=args.top_n,
+            rebalance=args.rebalance,
+            rebalance_tolerance=args.rebalance_tolerance,
+            rebalance_tolerance_by_asset=args.tolerance_band_map,
+            rebalance_to=args.rebalance_to,
+            core_weight=args.core_weight,
+            momentum_top_n=args.momentum_top_n,
+            momentum_score_mode=args.momentum_score_mode,
+            momentum_confirmation=args.momentum_confirmation,
+            defensive_asset=defensive_asset,
+            breadth_adjusted=args.breadth_adjusted,
+            breadth_full_threshold=args.breadth_full_threshold,
+            breadth_partial_threshold=args.breadth_partial_threshold,
+            breadth_partial_exposure=args.breadth_partial_exposure,
+            max_gross_exposure=args.max_exposure,
+            risk_mode=args.risk_mode,
+            **quality_options,
+        )
+        result = run_walk_forward_tolerance(
+            closes,
+            market,
+            base_config,
+            initial_equity=args.initial_capital,
+            values=parse_tolerance_values(args.tolerance_values),
+            train_years=args.walk_forward_train_years,
+            test_years=args.walk_forward_test_years,
+            optimize_metric=args.walk_forward_metric,
+            mode=args.walk_forward_mode,
+            quality_data=quality_data,
+        )
+        print(f"Data source: {data_source}")
+        print(f"Rows: {len(closes)} | Start: {closes.index[0].date()} | End: {closes.index[-1].date()}")
+        print(f"Universe source: {universe_source}")
+        print(f"Initial capital: {args.initial_capital:,.2f}")
+        print(
+            "Walk-forward tolerance: "
+            f"{args.walk_forward_mode}, train={args.walk_forward_train_years}y, "
+            f"test={args.walk_forward_test_years}y, metric={args.walk_forward_metric}"
+        )
+        if survivor_universe:
+            print("Bias warning: current-survivor universe, not point-in-time constituents.")
+        if result.empty:
+            print("No walk-forward windows were available. Use a longer date range.")
+        else:
+            display_cols = [
+                "train_start",
+                "train_end",
+                "test_start",
+                "test_end",
+                "chosen_tolerance",
+                "train_score",
+                "oos_total_return",
+                "oos_sharpe",
+                "oos_max_drawdown",
+                "oos_turnover",
+                "oos_final_equity",
+            ]
+            print()
+            print(result.loc[:, display_cols].round(4).to_string(index=False))
+            print()
+            final_equity = float(result["oos_final_equity"].iloc[-1])
+            print(f"Compounded OOS final equity: {final_equity:,.2f}")
+            print(f"Compounded OOS total return: {final_equity / args.initial_capital - 1.0:.4f}")
+        return
+
     if args.grid_search:
         result = run_grid_search(
             closes,
             market,
-            initial_equity=args.initial_capital,
-            quality_data=quality_data,
-            quality_options=quality_options,
-            rebalance_tolerance=args.rebalance_tolerance,
+                initial_equity=args.initial_capital,
+                quality_data=quality_data,
+                quality_options=quality_options,
+                rebalance_tolerance=args.rebalance_tolerance,
+                rebalance_tolerance_by_asset=args.tolerance_band_map,
             sort_by=args.sort_by,
         )
         display_cols = [
@@ -655,7 +1340,10 @@ def main() -> None:
         ]
         print(f"Data source: {data_source}")
         print(f"Rows: {len(closes)} | Start: {closes.index[0].date()} | End: {closes.index[-1].date()}")
+        print(f"Universe source: {universe_source}")
         print(f"Initial capital: {args.initial_capital:,.2f}")
+        if survivor_universe:
+            print("Bias warning: current-survivor universe, not point-in-time constituents.")
         print(f"Ranked by: {args.sort_by}")
         print()
         print(result.loc[:, display_cols].head(20).round(4).to_string(index=False))
@@ -666,7 +1354,17 @@ def main() -> None:
         top_n=args.top_n,
         rebalance=args.rebalance,
         rebalance_tolerance=args.rebalance_tolerance,
+        rebalance_tolerance_by_asset=args.tolerance_band_map,
+        rebalance_to=args.rebalance_to,
         core_weight=args.core_weight,
+        momentum_top_n=args.momentum_top_n,
+        momentum_score_mode=args.momentum_score_mode,
+        momentum_confirmation=args.momentum_confirmation,
+        defensive_asset=defensive_asset,
+        breadth_adjusted=args.breadth_adjusted,
+        breadth_full_threshold=args.breadth_full_threshold,
+        breadth_partial_threshold=args.breadth_partial_threshold,
+        breadth_partial_exposure=args.breadth_partial_exposure,
         max_gross_exposure=args.max_exposure,
         risk_mode=args.risk_mode,
         **quality_options,
@@ -686,7 +1384,13 @@ def main() -> None:
 
     print(f"Data source: {data_source}")
     print(f"Rows: {len(closes)} | Start: {closes.index[0].date()} | End: {closes.index[-1].date()}")
-    print(f"Allocation: {config.allocation_mode} | Risk mode: {config.risk_mode}")
+    print(f"Universe source: {universe_source}")
+    print(
+        f"Allocation: {config.allocation_mode} | Risk mode: {config.risk_mode} | "
+        f"Rebalance to: {config.rebalance_to}"
+    )
+    if survivor_universe:
+        print("Bias warning: current-survivor universe, not point-in-time constituents.")
     print(
         f"Initial capital: {args.initial_capital:,.2f} | "
         f"Final equity: {curve['equity'].iloc[-1]:,.2f}"

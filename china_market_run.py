@@ -228,6 +228,23 @@ def main() -> None:
         default=100_000.0,
         help="Starting account value for the backtest. Default: 100000.",
     )
+    parser.add_argument(
+        "--adf-filter",
+        action="store_true",
+        help="Require rolling residual stationarity before opening residual mean-reversion trades.",
+    )
+    parser.add_argument(
+        "--adf-lookback",
+        type=int,
+        default=252,
+        help="Rolling window for the residual ADF test. Default: 252.",
+    )
+    parser.add_argument(
+        "--adf-pvalue",
+        type=float,
+        default=0.10,
+        help="Maximum ADF p-value allowed for residual trades. Default: 0.10.",
+    )
     args = parser.parse_args()
 
     if args.csv is not None:
@@ -269,6 +286,9 @@ def main() -> None:
         max_position_fraction=args.max_position,
         transaction_cost_bps=4.0,
         slippage_bps=6.0,
+        use_adf_filter=args.adf_filter,
+        adf_lookback=args.adf_lookback,
+        adf_pvalue_threshold=args.adf_pvalue,
     )
     model = ETFRelativeMeanReversionModel(config=config)
     result = model.backtest(prices, initial_equity=args.initial_capital)
@@ -288,6 +308,8 @@ def main() -> None:
     columns = [
         "stock_close",
         "residual_z",
+        "residual_adf_pvalue",
+        "residual_stationary",
         "rsi",
         "risk_on",
         "position",

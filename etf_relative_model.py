@@ -35,6 +35,9 @@ class StrategyConfig:
     max_position_fraction: float = 1.0
     transaction_cost_bps: float = 2.0
     slippage_bps: float = 3.0
+    use_adf_filter: bool = False
+    adf_lookback: int = 252
+    adf_pvalue_threshold: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,60 @@ def rolling_proxy_residuals(
     return residual
 
 
+def rolling_adf_pvalues(series: pd.Series, lookback: int) -> pd.Series:
+    """
+    Rolling Augmented Dickey-Fuller p-values for residual stationarity checks.
+
+    If statsmodels is unavailable, the caller gets NaNs and can decide whether to
+    block trades or run without the filter.
+    """
+
+    try:
+        from statsmodels.tsa.stattools import adfuller
+    except ImportError:
+        adfuller = None
+
+    pvalues = pd.Series(np.nan, index=series.index, name="residual_adf_pvalue")
+    min_periods = max(40, lookback // 2)
+    for i in range(lookback, len(series)):
+        window = series.iloc[i - lookback : i].dropna()
+        if len(window) < min_periods or window.nunique() < 5:
+            continue
+        try:
+            if adfuller is not None:
+                pvalues.iloc[i] = float(adfuller(window, autolag="AIC")[1])
+            else:
+                pvalues.iloc[i] = approximate_adf_pvalue(window)
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+    return pvalues
+
+
+def approximate_adf_pvalue(window: pd.Series) -> float:
+    """Small dependency-free Dickey-Fuller approximation used when statsmodels is absent."""
+
+    values = window.to_numpy(dtype=float)
+    y_lag = values[:-1]
+    delta_y = np.diff(values)
+    x = np.column_stack([np.ones(len(y_lag)), y_lag])
+    beta, *_ = np.linalg.lstsq(x, delta_y, rcond=None)
+    residual = delta_y - x @ beta
+    degrees = max(len(delta_y) - x.shape[1], 1)
+    sigma2 = float((residual @ residual) / degrees)
+    covariance = sigma2 * np.linalg.pinv(x.T @ x)
+    standard_error = float(np.sqrt(max(covariance[1, 1], 0.0)))
+    if standard_error <= 0.0:
+        return 1.0
+    t_stat = float(beta[1] / standard_error)
+    if t_stat <= -3.43:
+        return 0.01
+    if t_stat <= -2.86:
+        return 0.05
+    if t_stat <= -2.57:
+        return 0.10
+    return 0.50
+
+
 class ETFRelativeMeanReversionModel:
     """
     Implements the final PDF framework:
@@ -179,6 +236,13 @@ class ETFRelativeMeanReversionModel:
             self.config.residual_z_lookback, min_periods=20
         ).std()
         data["residual_z"] = (data["residual_return"] - residual_mean) / residual_std
+        data["residual_adf_pvalue"] = rolling_adf_pvalues(
+            data["residual_return"],
+            self.config.adf_lookback,
+        )
+        data["residual_stationary"] = (
+            data["residual_adf_pvalue"] <= self.config.adf_pvalue_threshold
+        )
 
         high = prices[self.stock_high].astype(float) if self.stock_high in prices else None
         low = prices[self.stock_low].astype(float) if self.stock_low in prices else None
@@ -233,7 +297,12 @@ class ETFRelativeMeanReversionModel:
                 holding_days += 1
 
             row = features.iloc[i]
-            can_evaluate = pd.notna(row["residual_z"]) and pd.notna(row["rsi"])
+            adf_ok = (
+                True
+                if not self.config.use_adf_filter
+                else bool(row["residual_stationary"])
+            )
+            can_evaluate = pd.notna(row["residual_z"]) and pd.notna(row["rsi"]) and adf_ok
 
             trend_active = (
                 can_evaluate
